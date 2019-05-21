@@ -33,14 +33,16 @@ package com.salesforce.op
 import java.io.File
 
 import com.salesforce.op.OpWorkflowModelReadWriteShared.FieldNames._
-import com.salesforce.op.features.OPFeature
-import com.salesforce.op.features.types.{Real, RealNN}
-import com.salesforce.op.filters.FeatureDistribution
+import com.salesforce.op.features.types.{OPVector, Real}
+import com.salesforce.op.features.{FeatureBuilder, FeatureSparkTypes, OPFeature}
+import com.salesforce.op.filters._
 import com.salesforce.op.readers.{AggregateAvroReader, DataReaders}
 import com.salesforce.op.stages.OPStage
-import com.salesforce.op.stages.sparkwrappers.generic.SwUnaryEstimator
+import com.salesforce.op.stages.sparkwrappers.specific.OpEstimatorWrapper
 import com.salesforce.op.test.{Passenger, PassengerSparkFixtureTest}
 import org.apache.spark.ml.feature.{StandardScaler, StandardScalerModel}
+import org.apache.spark.ml.linalg.Vectors
+import org.apache.spark.sql.Row
 import org.joda.time.DateTime
 import org.json4s.jackson.JsonMethods._
 import org.json4s.{DefaultFormats, Formats, JArray, JValue}
@@ -48,6 +50,8 @@ import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
 import org.scalatest.{BeforeAndAfterEach, FlatSpec}
 import org.slf4j.LoggerFactory
+
+import scala.collection.JavaConverters._
 
 
 @RunWith(classOf[JUnitRunner])
@@ -87,14 +91,16 @@ class OpWorkflowModelReaderWriterTest
   val distributions = Array(FeatureDistribution("a", None, 1L, 1L, Array(1.0), Array(1.0)),
     FeatureDistribution("b", Option("b"), 2L, 2L, Array(2.0), Array(2.0)))
 
-  def makeDummyModel(wf: OpWorkflow): OpWorkflowModel = {
-    val model = new OpWorkflowModel(wf.uid, wf.parameters)
-      .setStages(wf.stages)
-      .setFeatures(wf.resultFeatures)
-      .setParameters(wf.parameters)
-      .setRawFeatureDistributions(distributions)
+  val rawFeatureFilterResults = RawFeatureFilterResults(rawFeatureDistributions = distributions)
 
-    model.setReader(wf.reader.get)
+
+  def makeDummyModel(wf: OpWorkflow): OpWorkflowModel = {
+    new OpWorkflowModel(wf.uid, wf.getParameters())
+      .setStages(wf.getStages())
+      .setFeatures(wf.getResultFeatures())
+      .setParameters(wf.getParameters())
+      .setRawFeatureFilterResults(wf.getRawFeatureFilterResults())
+      .setReader(wf.getReader())
   }
 
   def makeModelAndJson(wf: OpWorkflow): (OpWorkflowModel, JValue) = {
@@ -110,7 +116,7 @@ class OpWorkflowModelReaderWriterTest
       .setReader(dummyReader)
       .setResultFeatures(density)
       .setParameters(workflowParams)
-      .setRawFeatureDistributions(distributions)
+      .setRawFeatureFilterResults(rawFeatureFilterResults)
     val (wfM, jsonModel) = makeModelAndJson(wf)
   }
 
@@ -122,7 +128,7 @@ class OpWorkflowModelReaderWriterTest
       .setReader(dummyReader)
       .setResultFeatures(density, weight2)
       .setParameters(workflowParams)
-      .setRawFeatureDistributions(distributions)
+      .setRawFeatureFilterResults(rawFeatureFilterResults)
     val (wfM, jsonModel) = makeModelAndJson(wf)
   }
 
@@ -131,24 +137,23 @@ class OpWorkflowModelReaderWriterTest
       .setReader(dummyReader)
       .setResultFeatures(weight)
       .setParameters(workflowParams)
-      .setRawFeatureDistributions(distributions)
+      .setRawFeatureFilterResults(rawFeatureFilterResults)
     val (wfM, jsonModel) = makeModelAndJson(wf)
   }
 
   trait SwSingleStageFlow {
+    val vec = FeatureBuilder.OPVector[Passenger].extract(_ => OPVector.empty).asPredictor
     val scaler = new StandardScaler().setWithStd(false).setWithMean(false)
-    val swEstimator = new SwUnaryEstimator[RealNN, RealNN, StandardScalerModel, StandardScaler](
-      inputParamName = "foo",
-      outputParamName = "foo2",
-      operationName = "foo3",
-      sparkMlStageIn = Some(scaler)
-    )
-    val scaled = height.transformWith(swEstimator)
+    val schema = FeatureSparkTypes.toStructType(vec)
+    val data = spark.createDataFrame(List(Row(Vectors.dense(1.0))).asJava, schema)
+    val swEstimatorModel = new OpEstimatorWrapper[OPVector, OPVector, StandardScaler, StandardScalerModel](scaler)
+      .setInput(vec).fit(data)
+    val scaled = vec.transformWith(swEstimatorModel)
     val wf = new OpWorkflow()
       .setParameters(workflowParams)
       .setReader(dummyReader)
       .setResultFeatures(scaled)
-      .setRawFeatureDistributions(distributions)
+      .setRawFeatureFilterResults(rawFeatureFilterResults)
     val (wfM, jsonModel) = makeModelAndJson(wf)
   }
 
@@ -245,9 +250,16 @@ class OpWorkflowModelReaderWriterTest
     compareWorkflowModels(model, wfMR)
   }
 
-  trait VectorizedFlow extends UIDReset {
+  trait OldVectorizedFlow extends UIDReset {
     val cat = Seq(gender, boarded, height, age, description).transmogrify()
     val catHead = cat.map[Real](v => Real(v.value.toArray.headOption))
+    val wf = new OpWorkflow()
+      .setParameters(workflowParams)
+      .setResultFeatures(catHead)
+  }
+
+  trait VectorizedFlow extends UIDReset {
+    val catHead = rawFeatures.transmogrify().map[Real](v => Real(v.value.toArray.headOption))
     val wf = new OpWorkflow()
       .setParameters(workflowParams)
       .setResultFeatures(catHead)
@@ -261,13 +273,19 @@ class OpWorkflowModelReaderWriterTest
     compareWorkflowModels(wfMR, wfM)
   }
 
-  it should "save a workflow model that has a RawFeatureFilter" in new VectorizedFlow {
-    wf.withRawFeatureFilter(Some(dataReader), None, minFillRate = 0.8)
+  it should "save a workflow model that has a RawFeatureFilter with correct blacklists" in new VectorizedFlow {
+    wf.withRawFeatureFilter(trainingReader = Some(dataReader), scoringReader = Some(simpleReader),
+      bins = 10, minFillRate = 0.1, maxFillDifference = 0.1, maxFillRatioDiff = 2,
+      maxJSDivergence = 0.2, maxCorrelation = 0.9, minScoringRows = 0
+    )
     val wfM = wf.train()
     wfM.save(saveFlowPathStable)
-    wf.getBlacklist().map(_.name) should contain theSameElementsAs Array("age", "description")
+    wf.getBlacklist().map(_.name) should contain theSameElementsAs
+      Array("age", "boarded", "description", "gender", "height", "weight")
+    wf.getBlacklistMapKeys() shouldBe
+      Map("booleanMap" -> Set("Male"), "stringMap" -> Set("Male"), "numericMap" -> Set("Male"))
+
     val wfMR = wf.loadModel(saveFlowPathStable)
-    wfMR.getBlacklist().map(_.name) should contain theSameElementsAs Array("age", "description")
     compareWorkflowModels(wfM, wfMR)
   }
 
@@ -275,15 +293,48 @@ class OpWorkflowModelReaderWriterTest
     val wfM = wf.loadModel(saveFlowPathStable)
     wf.getResultFeatures().head.name shouldBe wfM.getResultFeatures().head.name
     wf.getResultFeatures().head.history().originFeatures should contain theSameElementsAs
-      Array("age", "boarded", "description", "gender", "height")
+      Array("age", "boarded", "booleanMap", "description", "gender", "height", "numericMap",
+        "stringMap", "survived", "weight")
     wfM.getResultFeatures().head.history().originFeatures should contain theSameElementsAs
-      Array("boarded", "gender", "height")
-    wfM.getBlacklist().map(_.name) should contain theSameElementsAs Array("age", "description")
+      Array("booleanMap", "numericMap", "stringMap", "survived")
+    wfM.getBlacklist().map(_.name) should contain theSameElementsAs
+      Array("age", "boarded", "description", "gender", "height", "weight")
   }
 
-  it should "be able to load a old version of a saved model" in new VectorizedFlow {
+  it should "load model and allow copying it" in new VectorizedFlow {
+    val wfM = wf.loadModel(saveFlowPathStable).setReader(dataReader)
+    val copy = wfM.copy()
+    copy.uid shouldBe wfM.uid
+    copy.trainingParams.toString shouldBe wfM.trainingParams.toString
+    copy.isWorkflowCV shouldBe wfM.isWorkflowCV
+    copy.getReader() shouldBe wfM.getReader()
+    copy.getResultFeatures() shouldBe wfM.getResultFeatures()
+    copy.getRawFeatures() shouldBe wfM.getRawFeatures()
+    copy.getBlacklist() shouldBe wfM.getBlacklist()
+    copy.getBlacklistMapKeys() shouldBe wfM.getBlacklistMapKeys()
+    copy.getRawFeatureFilterResults() shouldBe wfM.getRawFeatureFilterResults()
+    copy.getStages().map(_.uid) shouldBe wfM.getStages().map(_.uid)
+    copy.getParameters().toString shouldBe wfM.getParameters().toString
+  }
+
+  it should "be able to load a old version of a saved model" in new OldVectorizedFlow {
     val wfM = wf.loadModel("src/test/resources/OldModelVersion")
     wfM.getBlacklist().isEmpty shouldBe true
+  }
+
+  it should "be able to load a old version of a saved model (v0.5.1)" in new OldVectorizedFlow {
+    // note: in these old models, raw feature filter config will be set to the config defaults
+    // but we never re-initialize raw feature filter when loading a model (only scoring, no training)
+    val wfM = wf.loadModel("src/test/resources/OldModelVersion_0_5_1")
+    wfM.getRawFeatureFilterResults().rawFeatureFilterMetrics shouldBe empty
+    wfM.getRawFeatureFilterResults().exclusionReasons shouldBe empty
+  }
+
+  it should "error on loading a model without workflow" in {
+    val error = intercept[RuntimeException](OpWorkflowModel.load(saveFlowPathStable))
+    error.getMessage should startWith("Failed to load Workflow from path")
+    error.getCause.isInstanceOf[NotImplementedError] shouldBe true
+    error.getCause.getMessage shouldBe "Loading models without the original workflow is currently not supported"
   }
 
   def compareFeatures(f1: Array[OPFeature], f2: Array[OPFeature]): Unit = {
@@ -308,41 +359,31 @@ class OpWorkflowModelReaderWriterTest
 
   def compareWorkflows(wf1: OpWorkflow, wf2: OpWorkflow): Unit = {
     wf1.uid shouldBe wf2.uid
-    compareParams(wf1.parameters, wf2.parameters)
-    compareFeatures(wf1.resultFeatures, wf2.resultFeatures)
-    compareFeatures(wf1.blacklistedFeatures, wf2.blacklistedFeatures)
-    compareFeatures(wf1.rawFeatures, wf2.rawFeatures)
-    compareStages(wf1.stages, wf2.stages)
-    compareDistributions(wf1.getRawFeatureDistributions(), wf2.getRawFeatureDistributions())
+    compareParams(wf1.getParameters(), wf2.getParameters())
+    compareFeatures(wf1.getResultFeatures(), wf2.getResultFeatures())
+    compareFeatures(wf1.getBlacklist(), wf2.getBlacklist())
+    compareFeatures(wf1.getRawFeatures(), wf2.getRawFeatures())
+    compareStages(wf1.getStages(), wf2.getStages())
+    wf1.getBlacklistMapKeys() shouldBe  wf2.getBlacklistMapKeys()
+    RawFeatureFilterResultsComparison.compare(wf1.getRawFeatureFilterResults(), wf2.getRawFeatureFilterResults())
   }
 
   def compareWorkflowModels(wf1: OpWorkflowModel, wf2: OpWorkflowModel): Unit = {
     wf1.uid shouldBe wf2.uid
     compareParams(wf1.trainingParams, wf2.trainingParams)
-    compareParams(wf1.parameters, wf2.parameters)
-    compareFeatures(wf1.resultFeatures, wf2.resultFeatures)
-    compareFeatures(wf1.blacklistedFeatures, wf2.blacklistedFeatures)
-    compareFeatures(wf1.rawFeatures, wf2.rawFeatures)
-    compareStages(wf1.stages, wf2.stages)
-    compareDistributions(wf1.getRawFeatureDistributions(), wf2.getRawFeatureDistributions())
+    compareParams(wf1.getParameters(), wf2.getParameters())
+    compareFeatures(wf1.getResultFeatures(), wf2.getResultFeatures())
+    compareFeatures(wf1.getBlacklist(), wf2.getBlacklist())
+    compareFeatures(wf1.getRawFeatures(), wf2.getRawFeatures())
+    compareStages(wf1.getStages(), wf2.getStages())
+    wf1.getBlacklistMapKeys() shouldBe  wf2.getBlacklistMapKeys()
+    RawFeatureFilterResultsComparison.compare(wf1.getRawFeatureFilterResults(), wf2.getRawFeatureFilterResults())
   }
 
   def compareParams(p1: OpParams, p2: OpParams): Unit = {
     p1.stageParams shouldBe p2.stageParams
     p1.readerParams.toString() shouldBe p2.readerParams.toString()
     p1.customParams shouldBe p2.customParams
-  }
-
-  def compareDistributions(d1: Array[FeatureDistribution], d2: Array[FeatureDistribution]): Unit = {
-    d1.zip(d2)
-      .foreach{ case (a, b) =>
-        a.name shouldEqual b.name
-        a.key shouldEqual b.key
-        a.count shouldEqual b.count
-        a.nulls shouldEqual b.nulls
-        a.distribution shouldEqual b.distribution
-        a.summaryInfo shouldEqual b.summaryInfo
-      }
   }
 }
 

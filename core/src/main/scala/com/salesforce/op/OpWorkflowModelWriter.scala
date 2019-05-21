@@ -31,7 +31,7 @@
 package com.salesforce.op
 
 import com.salesforce.op.features.FeatureJsonHelper
-import com.salesforce.op.filters.FeatureDistribution
+import com.salesforce.op.filters.RawFeatureFilterResults
 import com.salesforce.op.stages.{OpPipelineStageBase, OpPipelineStageWriter}
 import enumeratum._
 import org.apache.hadoop.fs.Path
@@ -77,18 +77,23 @@ class OpWorkflowModelWriter(val model: OpWorkflowModel) extends MLWriter {
     (FN.Uid.entryName -> model.uid) ~
       (FN.ResultFeaturesUids.entryName -> resultFeaturesJArray) ~
       (FN.BlacklistedFeaturesUids.entryName -> blacklistFeaturesJArray()) ~
+      (FN.BlacklistedMapKeys.entryName -> blacklistMapKeys()) ~
       (FN.Stages.entryName -> stagesJArray(path)) ~
       (FN.AllFeatures.entryName -> allFeaturesJArray) ~
-      (FN.Parameters.entryName -> model.parameters.toJson(pretty = false)) ~
+      (FN.Parameters.entryName -> model.getParameters().toJson(pretty = false)) ~
       (FN.TrainParameters.entryName -> model.trainingParams.toJson(pretty = false)) ~
-      (FN.RawFeatureDistributions.entryName -> FeatureDistribution.toJson(model.getRawFeatureDistributions()))
+      (FN.RawFeatureFilterResultsFieldName.entryName ->
+        RawFeatureFilterResults.toJson(model.getRawFeatureFilterResults()))
   }
 
   private def resultFeaturesJArray(): JArray =
-    JArray(model.resultFeatures.map(_.uid).map(JString).toList)
+    JArray(model.getResultFeatures().map(_.uid).map(JString).toList)
 
   private def blacklistFeaturesJArray(): JArray =
-    JArray(model.blacklistedFeatures.map(_.uid).map(JString).toList)
+    JArray(model.getBlacklist().map(_.uid).map(JString).toList)
+
+  private def blacklistMapKeys(): JObject =
+    JObject(model.getBlacklistMapKeys().map { case (k, vs) => k -> JArray(vs.map(JString).toList) }.toList)
 
   /**
    * Serialize all the workflow model stages
@@ -97,8 +102,10 @@ class OpWorkflowModelWriter(val model: OpWorkflowModel) extends MLWriter {
    * @return array of serialized stages
    */
   private def stagesJArray(path: String): JArray = {
-    val stages: Seq[OpPipelineStageBase] = model.stages
-    val stagesJson: Seq[JObject] = stages.map(_.write.asInstanceOf[OpPipelineStageWriter].writeToJson(path))
+    val stages: Seq[OpPipelineStageBase] = model.getStages()
+    val stagesJson: Seq[JObject] = stages
+      .map(_.write.asInstanceOf[OpPipelineStageWriter].writeToJson(path))
+      .filter(_.children.nonEmpty)
     JArray(stagesJson.toList)
   }
 
@@ -108,10 +115,8 @@ class OpWorkflowModelWriter(val model: OpWorkflowModel) extends MLWriter {
    * @note Features should be topologically sorted
    * @return all features to be serialized
    */
-  private def allFeaturesJArray: JArray = {
-    val features = model.rawFeatures ++ model.stages.flatMap(s => s.getInputFeatures()) ++ model.resultFeatures
-    JArray(features.distinct.map(FeatureJsonHelper.toJson).toList)
-  }
+  private def allFeaturesJArray: JArray =
+    JArray(model.getAllFeatures().map(FeatureJsonHelper.toJson).toList)
 
 }
 
@@ -134,11 +139,12 @@ private[op] object OpWorkflowModelReadWriteShared {
     case object Uid extends FieldNames("uid")
     case object ResultFeaturesUids extends FieldNames("resultFeaturesUids")
     case object BlacklistedFeaturesUids extends FieldNames("blacklistedFeaturesUids")
+    case object BlacklistedMapKeys extends FieldNames("blacklistedMapKeys")
     case object Stages extends FieldNames("stages")
     case object AllFeatures extends FieldNames("allFeatures")
     case object Parameters extends FieldNames("parameters")
     case object TrainParameters extends FieldNames("trainParameters")
-    case object RawFeatureDistributions extends FieldNames("rawFeatureDistributions")
+    case object RawFeatureFilterResultsFieldName extends FieldNames("rawFeatureFilterResults")
   }
 
 }

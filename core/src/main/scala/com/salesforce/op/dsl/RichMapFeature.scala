@@ -76,14 +76,15 @@ trait RichMapFeature {
     /**
      * Apply TextMapPivotVectorizer on any OPMap that has string values
      *
-     * @param others        other features of the same type
-     * @param topK          number of values to keep for each key
-     * @param minSupport    min times a value must occur to be retained in pivot
-     * @param cleanText     clean text before pivoting
-     * @param cleanKeys     clean map keys before pivoting
-     * @param whiteListKeys keys to whitelist
-     * @param blackListKeys keys to blacklist
-     * @param trackNulls    option to keep track of values that were missing
+     * @param others            other features of the same type
+     * @param topK              number of values to keep for each key
+     * @param minSupport        min times a value must occur to be retained in pivot
+     * @param cleanText         clean text before pivoting
+     * @param cleanKeys         clean map keys before pivoting
+     * @param whiteListKeys     keys to whitelist
+     * @param blackListKeys     keys to blacklist
+     * @param trackNulls        option to keep track of values that were missing
+     * @param maxPctCardinality max percentage of distinct values a categorical feature can have (between 0.0 and 1.00)
      *
      * @return an OPVector feature
      */
@@ -95,7 +96,8 @@ trait RichMapFeature {
       whiteListKeys: Array[String] = Array.empty,
       blackListKeys: Array[String] = Array.empty,
       trackNulls: Boolean = TransmogrifierDefaults.TrackNulls,
-      others: Array[FeatureLike[T]] = Array.empty
+      others: Array[FeatureLike[T]] = Array.empty,
+      maxPctCardinality: Double = OpOneHotVectorizer.MaxPctCardinality
     ): FeatureLike[OPVector] = {
       new TextMapPivotVectorizer[T]()
         .setInput(f +: others)
@@ -106,6 +108,7 @@ trait RichMapFeature {
         .setWhiteListKeys(whiteListKeys)
         .setBlackListKeys(blackListKeys)
         .setTrackNulls(trackNulls)
+        .setMaxPctCardinality(maxPctCardinality)
         .getOutput()
     }
   }
@@ -135,15 +138,16 @@ trait RichMapFeature {
      * and then vectorized using the TextMapPivotVectorizer.
      *
      *
-     * @param others        other features of the same type
-     * @param topK          number of values to keep for each key
-     * @param minSupport    min times a value must occur to be retained in pivot
-     * @param cleanText     clean text before pivoting
-     * @param cleanKeys     clean map keys before pivoting
-     * @param whiteListKeys keys to whitelist
-     * @param blackListKeys keys to blacklist
-     * @param typeHint      optional hint for MIME type detector
-     * @param trackNulls    option to keep track of values that were missing
+     * @param others            other features of the same type
+     * @param topK              number of values to keep for each key
+     * @param minSupport        min times a value must occur to be retained in pivot
+     * @param cleanText         clean text before pivoting
+     * @param cleanKeys         clean map keys before pivoting
+     * @param whiteListKeys     keys to whitelist
+     * @param blackListKeys     keys to blacklist
+     * @param typeHint          optional hint for MIME type detector
+     * @param trackNulls        option to keep track of values that were missing
+     * @param maxPctCardinality max percentage of distinct values a categorical feature can have (between 0.0 and 1.00)
      *
      * @return an OPVector feature
      */
@@ -156,7 +160,8 @@ trait RichMapFeature {
       blackListKeys: Array[String] = Array.empty,
       typeHint: Option[String] = None,
       trackNulls: Boolean = TransmogrifierDefaults.TrackNulls,
-      others: Array[FeatureLike[Base64Map]] = Array.empty
+      others: Array[FeatureLike[Base64Map]] = Array.empty,
+      maxPctCardinality: Double = OpOneHotVectorizer.MaxPctCardinality
     ): FeatureLike[OPVector] = {
 
       val feats: Array[FeatureLike[PickListMap]] = (f +: others).map(_.detectMimeTypes(typeHint))
@@ -170,6 +175,7 @@ trait RichMapFeature {
         .setWhiteListKeys(whiteListKeys)
         .setBlackListKeys(blackListKeys)
         .setTrackNulls(trackNulls)
+        .setMaxPctCardinality(maxPctCardinality)
         .getOutput()
     }
   }
@@ -476,14 +482,15 @@ trait RichMapFeature {
     /**
      * Apply MultiPickListMapVectorizer on any OPMap that has set values
      *
-     * @param others        other features of the same type
-     * @param topK          number of values to keep for each key
-     * @param minSupport    min times a value must occur to be retained in pivot
-     * @param cleanText     clean text before pivoting
-     * @param cleanKeys     clean map keys before pivoting
-     * @param whiteListKeys keys to whitelist
-     * @param blackListKeys keys to blacklist
-     * @param trackNulls    option to keep track of values that were missing
+     * @param others            other features of the same type
+     * @param topK              number of values to keep for each key
+     * @param minSupport        min times a value must occur to be retained in pivot
+     * @param cleanText         clean text before pivoting
+     * @param cleanKeys         clean map keys before pivoting
+     * @param whiteListKeys     keys to whitelist
+     * @param blackListKeys     keys to blacklist
+     * @param trackNulls        option to keep track of values that were missing
+     * @param maxPctCardinality max percentage of distinct values a categorical feature can have (between 0.0 and 1.00)
      *
      * @return an OPVector feature
      */
@@ -495,7 +502,8 @@ trait RichMapFeature {
       whiteListKeys: Array[String] = Array.empty,
       blackListKeys: Array[String] = Array.empty,
       others: Array[FeatureLike[T]] = Array.empty,
-      trackNulls: Boolean = TransmogrifierDefaults.TrackNulls
+      trackNulls: Boolean = TransmogrifierDefaults.TrackNulls,
+      maxPctCardinality: Double = OpOneHotVectorizer.MaxPctCardinality
     ): FeatureLike[OPVector] = {
       new MultiPickListMapVectorizer[T]()
         .setInput(f +: others)
@@ -506,6 +514,7 @@ trait RichMapFeature {
         .setWhiteListKeys(whiteListKeys)
         .setBlackListKeys(blackListKeys)
         .setTrackNulls(trackNulls)
+        .setMaxPctCardinality(maxPctCardinality)
         .getOutput()
     }
   }
@@ -694,6 +703,14 @@ trait RichMapFeature {
   implicit class RichDateMapFeature(val f: FeatureLike[DateMap]) {
 
     /**
+     * Convert to specified time period
+     * @param period type of [[TimePeriod]] to convert date feature to
+     * @return Integer map feature of time period values
+     */
+    def toTimePeriod(period: TimePeriod): FeatureLike[IntegralMap] =
+      new TimePeriodMapTransformer[DateMap](period).setInput(f).getOutput()
+
+    /**
      * transforms a DateMap field into a series of cartesian coordinate representation
      * of an extracted time period on the unit circle
      *
@@ -772,6 +789,13 @@ trait RichMapFeature {
    */
   implicit class RichDateTimeMapFeature(val f: FeatureLike[DateTimeMap]) {
 
+    /**
+     * Convert to specified time period
+     * @param period type of [[TimePeriod]] to convert date feature to
+     * @return Integer map feature of time period values
+     */
+    def toTimePeriod(period: TimePeriod): FeatureLike[IntegralMap] =
+      new TimePeriodMapTransformer[DateTimeMap](period).setInput(f).getOutput()
 
     /**
      * transforms a DateTimeMap field into a series of cartesian coordinate representation
@@ -982,13 +1006,15 @@ trait RichMapFeature {
      * Transform EmailMap feature to PickListMap by extracting email domains, converting them
      * to PickList and then vectorize the PickListMap
      *
-     * @param topK          number of values to keep for each key
-     * @param minSupport    min times a value must occur to be retained in pivot
-     * @param cleanText     clean text after email split but before pivoting
-     * @param cleanKeys     clean map keys before pivoting
-     * @param whiteListKeys keys to whitelist
-     * @param blackListKeys keys to blacklist
-     * @param trackNulls    option to keep track of values that were missing
+     * @param topK              number of values to keep for each key
+     * @param minSupport        min times a value must occur to be retained in pivot
+     * @param cleanText         clean text after email split but before pivoting
+     * @param cleanKeys         clean map keys before pivoting
+     * @param whiteListKeys     keys to whitelist
+     * @param blackListKeys     keys to blacklist
+     * @param trackNulls        option to keep track of values that were missing
+     * @param maxPctCardinality max percentage of distinct values a categorical feature can have (between 0.0 and 1.00)
+     *
      * @return an OPVector feature
      */
     def vectorize(
@@ -999,7 +1025,8 @@ trait RichMapFeature {
       whiteListKeys: Array[String] = Array.empty,
       blackListKeys: Array[String] = Array.empty,
       trackNulls: Boolean = TransmogrifierDefaults.TrackNulls,
-      others: Array[FeatureLike[EmailMap]] = Array.empty
+      others: Array[FeatureLike[EmailMap]] = Array.empty,
+      maxPctCardinality: Double = OpOneHotVectorizer.MaxPctCardinality
     ): FeatureLike[OPVector] = {
       val domains: Array[FeatureLike[PickListMap]] = (f +: others).map { e =>
         val transformer = new OPMapTransformer[Email, PickList, EmailMap, PickListMap](
@@ -1015,7 +1042,7 @@ trait RichMapFeature {
       domains.head.vectorize(
         topK = topK, minSupport = minSupport, cleanText = cleanText, cleanKeys = cleanKeys,
         whiteListKeys = whiteListKeys, blackListKeys = blackListKeys,
-        others = domains.tail, trackNulls = trackNulls
+        others = domains.tail, trackNulls = trackNulls, maxPctCardinality = maxPctCardinality
       )
     }
   }
@@ -1031,13 +1058,15 @@ trait RichMapFeature {
      * Transform URLMap feature to PickListMap by extracting domains of valid urls, converting them
      * to PickList and then vectorize the PickListMap
      *
-     * @param topK          number of values to keep for each key
-     * @param minSupport    min times a value must occur to be retained in pivot
-     * @param cleanText     clean text after email split but before pivoting
-     * @param cleanKeys     clean map keys before pivoting
-     * @param whiteListKeys keys to whitelist
-     * @param blackListKeys keys to blacklist
-     * @param trackNulls    option to keep track of values that were missing
+     * @param topK              number of values to keep for each key
+     * @param minSupport        min times a value must occur to be retained in pivot
+     * @param cleanText         clean text after email split but before pivoting
+     * @param cleanKeys         clean map keys before pivoting
+     * @param whiteListKeys     keys to whitelist
+     * @param blackListKeys     keys to blacklist
+     * @param trackNulls        option to keep track of values that were missing
+     * @param maxPctCardinality max percentage of distinct values a categorical feature can have (between 0.0 and 1.00)
+     *
      * @return an OPVector feature
      */
     def vectorize(
@@ -1048,7 +1077,8 @@ trait RichMapFeature {
       whiteListKeys: Array[String] = Array.empty,
       blackListKeys: Array[String] = Array.empty,
       trackNulls: Boolean = TransmogrifierDefaults.TrackNulls,
-      others: Array[FeatureLike[URLMap]] = Array.empty
+      others: Array[FeatureLike[URLMap]] = Array.empty,
+      maxPctCardinality: Double = OpOneHotVectorizer.MaxPctCardinality
     ): FeatureLike[OPVector] = {
       val domains: Array[FeatureLike[PickListMap]] = (f +: others).map { e =>
         val transformer =
@@ -1064,7 +1094,7 @@ trait RichMapFeature {
       domains.head.vectorize(
         topK = topK, minSupport = minSupport, cleanText = cleanText, cleanKeys = cleanKeys,
         whiteListKeys = whiteListKeys, blackListKeys = blackListKeys,
-        others = domains.tail, trackNulls = trackNulls
+        others = domains.tail, trackNulls = trackNulls, maxPctCardinality = maxPctCardinality
       )
     }
   }

@@ -32,9 +32,9 @@ package com.salesforce.op
 
 import com.salesforce.op.OpWorkflowModelReadWriteShared.FieldNames._
 import com.salesforce.op.features.{FeatureJsonHelper, OPFeature, TransientFeature}
-import com.salesforce.op.filters.FeatureDistribution
+import com.salesforce.op.filters.{FeatureDistribution, RawFeatureFilterResults}
 import com.salesforce.op.stages.OpPipelineStageReadWriteShared._
-import com.salesforce.op.stages.{OpPipelineStageReader, _}
+import com.salesforce.op.stages._
 import org.apache.spark.ml.util.MLReader
 import org.json4s.JsonAST.{JArray, JNothing, JValue}
 import org.json4s.jackson.JsonMethods.parse
@@ -46,9 +46,10 @@ import scala.util.{Failure, Success, Try}
  * This will only work if the features were serialized in topological order.
  * NOTE: The FeatureGeneratorStages will not be recovered into the Model object, because they are part of each feature.
  *
- * @param workflow the workflow that produced the trained model
+ * @param workflowOpt optional workflow that produced the trained model
  */
-class OpWorkflowModelReader(val workflow: OpWorkflow) extends MLReader[OpWorkflowModel] {
+class OpWorkflowModelReader(val workflowOpt: Option[OpWorkflow]) extends MLReader[OpWorkflowModel] {
+
 
   /**
    * Load a previously trained workflow model from path
@@ -80,36 +81,54 @@ class OpWorkflowModelReader(val workflow: OpWorkflow) extends MLReader[OpWorkflo
    * @param path to the trained workflow model
    * @return workflow model instance
    */
-  def loadJson(json: JValue, path: String): Try[OpWorkflowModel] = {
-    for {
-      trainParams <- OpParams.fromString((json \ TrainParameters.entryName).extract[String])
-      params <- OpParams.fromString((json \ Parameters.entryName).extract[String])
-      model <- Try(new OpWorkflowModel(uid = (json \ Uid.entryName).extract[String], trainParams))
-      (stages, resultFeatures) <- Try(resolveFeaturesAndStages(json, path))
-      blacklist <- Try(resolveBlacklist(json))
-      distributions <- resolveRawFeatureDistributions(json)
-    } yield model
-      .setStages(stages.filterNot(_.isInstanceOf[FeatureGeneratorStage[_, _]]))
-      .setFeatures(resultFeatures)
-      .setParameters(params)
-      .setBlacklist(blacklist)
-      .setRawFeatureDistributions(distributions)
+  def loadJson(json: JValue, path: String): Try[OpWorkflowModel] = workflowOpt match {
+    case None =>
+      throw new NotImplementedError("Loading models without the original workflow is currently not supported")
+
+    case Some(workflow) =>
+      for {
+        trainParams <- OpParams.fromString((json \ TrainParameters.entryName).extract[String])
+        params <- OpParams.fromString((json \ Parameters.entryName).extract[String])
+        model <- Try(new OpWorkflowModel(uid = (json \ Uid.entryName).extract[String], trainParams))
+        (stages, resultFeatures) <- Try(resolveFeaturesAndStages(workflow, json, path))
+        blacklist <- Try(resolveBlacklist(workflow, json))
+        blacklistMapKeys <- Try(resolveBlacklistMapKeys(json))
+        results <- resolveRawFeatureFilterResults(json)
+      } yield model
+        .setStages(stages.filterNot(_.isInstanceOf[FeatureGeneratorStage[_, _]]))
+        .setFeatures(resultFeatures)
+        .setParameters(params)
+        .setBlacklist(blacklist)
+        .setBlacklistMapKeys(blacklistMapKeys)
+        .setRawFeatureFilterResults(results)
   }
 
-  private def resolveBlacklist(json: JValue): Array[OPFeature] = {
+  private def resolveBlacklist(workflow: OpWorkflow, json: JValue): Array[OPFeature] = {
     if ((json \ BlacklistedFeaturesUids.entryName) != JNothing) { // for backwards compatibility
       val blacklistIds = (json \ BlacklistedFeaturesUids.entryName).extract[JArray].arr
-      val allFeatures = workflow.rawFeatures ++ workflow.blacklistedFeatures ++
-        workflow.stages.flatMap(s => s.getInputFeatures()) ++
-        workflow.resultFeatures
+      val allFeatures = workflow.getRawFeatures() ++ workflow.getBlacklist() ++
+        workflow.getStages().flatMap(_.getInputFeatures()) ++
+        workflow.getResultFeatures()
       blacklistIds.flatMap(uid => allFeatures.find(_.uid == uid.extract[String])).toArray
     } else {
       Array.empty[OPFeature]
     }
   }
 
-  private def resolveFeaturesAndStages(json: JValue, path: String): (Array[OPStage], Array[OPFeature]) = {
-    val stages = loadStages(json, path)
+  private def resolveBlacklistMapKeys(json: JValue): Map[String, Set[String]] = {
+    (json \ BlacklistedMapKeys.entryName).extractOpt[Map[String, List[String]]] match {
+      case Some(blackMapKeys) => blackMapKeys.map { case (k, vs) => k -> vs.toSet }
+      case None => Map.empty
+    }
+  }
+
+  private def resolveFeaturesAndStages
+  (
+    workflow: OpWorkflow,
+    json: JValue,
+    path: String
+  ): (Array[OPStage], Array[OPFeature]) = {
+    val stages = loadStages(workflow, json, path)
     val stagesMap = stages.map(stage => stage.uid -> stage).toMap[String, OPStage]
     val featuresMap = resolveFeatures(json, stagesMap)
     resolveStages(stages, featuresMap)
@@ -120,17 +139,19 @@ class OpWorkflowModelReader(val workflow: OpWorkflow) extends MLReader[OpWorkflo
     stages.toArray -> resultFeatures.toArray
   }
 
-  private def loadStages(json: JValue, path: String): Seq[OPStage] = {
+  private def loadStages(workflow: OpWorkflow, json: JValue, path: String): Seq[OPStage] = {
     val stagesJs = (json \ Stages.entryName).extract[JArray].arr
-    val recoveredStages = stagesJs.map(j => {
-      val stageUid = (j \ FieldNames.Uid.entryName).extract[String]
-      val originalStage = workflow.stages.find(_.uid == stageUid)
-      originalStage match {
-        case Some(os) => new OpPipelineStageReader(os).loadFromJson(j, path = path).asInstanceOf[OPStage]
-        case None => throw new RuntimeException(s"Workflow does not contain a stage with uid: $stageUid")
+    val recoveredStages = stagesJs.flatMap { j =>
+      val stageUidOpt = (j \ Uid.entryName).extractOpt[String]
+      stageUidOpt.map { stageUid =>
+        val originalStage = workflow.getStages().find(_.uid == stageUid)
+        originalStage match {
+          case Some(os) => new OpPipelineStageReader(os).loadFromJson(j, path = path).asInstanceOf[OPStage]
+          case None => throw new RuntimeException(s"Workflow does not contain a stage with uid: $stageUid")
+        }
       }
-    })
-    val generators = workflow.rawFeatures.map(_.originStage)
+    }
+    val generators = workflow.getRawFeatures().map(_.originStage)
     generators ++ recoveredStages
   }
 
@@ -154,12 +175,24 @@ class OpWorkflowModelReader(val workflow: OpWorkflow) extends MLReader[OpWorkflo
     }
   }
 
-  private def resolveRawFeatureDistributions(json: JValue): Try[Array[FeatureDistribution]] = {
-    if ((json \ RawFeatureDistributions.entryName) != JNothing) { // for backwards compatibility
-      val distString = (json \ RawFeatureDistributions.entryName).extract[String]
-      FeatureDistribution.fromJson(distString)
-    } else {
-      Success(Array.empty[FeatureDistribution])
+  private def resolveRawFeatureFilterResults(json: JValue): Try[RawFeatureFilterResults] = {
+    if ((json \ RawFeatureFilterResultsFieldName.entryName) != JNothing) {
+      val resultsString = (json \ RawFeatureFilterResultsFieldName.entryName).extract[String]
+      RawFeatureFilterResults.fromJson(resultsString)
+    }
+    else { // for backwards compatibility
+      /**
+       * RawFeatureDistributions is now contained in and written / read through RawFeatureFilterResults.
+       * All setters of RawFeatureDistributions are now deprecated.
+       * This resolve function is to allow backwards compatibility where RawFeatureDistributions was a saved field
+       */
+      val rawFeatureDistributionsEntryName = "rawFeatureDistributions"
+      if ((json \ rawFeatureDistributionsEntryName) != JNothing) {
+        val distString = (json \ rawFeatureDistributionsEntryName).extract[String]
+        FeatureDistribution.fromJson(distString).map(d => RawFeatureFilterResults(rawFeatureDistributions = d))
+      } else {
+        Success(RawFeatureFilterResults())
+      }
     }
   }
 
